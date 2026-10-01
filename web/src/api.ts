@@ -1586,11 +1586,7 @@ export type AlertGroup = {
     job?: string;
     warnings?: {
       kind: string;
-      provenance: {
-        origin: string;
-        model: string | null;
-        anchor: Record<string, unknown> | null;
-      };
+      detail: Record<string, unknown>;
     }[];
   }[];
 };

@@ -56,7 +56,7 @@ pub async fn observe_job_failure(
     state.emit_alert();
 }
 
-/// 解析器只读了一部分正文：保留可用的前缀，但把截断范围和出处写进告警详情。
+/// 解析器只读了一部分正文：保留可用的前缀，但把截断范围写进告警详情。
 /// 名字存一份——文档删掉之后这条告警还读得懂。
 pub async fn observe_document_truncated(
     state: &AppState,
@@ -96,14 +96,7 @@ fn document_truncation_detail(
         "name": filename,
         "warnings": warnings
             .iter()
-            .map(|warning| serde_json::json!({
-                "kind": warning.kind,
-                "provenance": {
-                    "origin": warning.provenance.origin.as_str(),
-                    "model": warning.provenance.model.as_deref(),
-                    "anchor": warning.provenance.anchor.as_ref(),
-                },
-            }))
+            .map(|warning| serde_json::json!({ "kind": warning.kind, "detail": warning.detail }))
             .collect::<Vec<_>>(),
     })
 }
@@ -242,7 +235,7 @@ pub async fn observe_schema_sync_failure(
 #[cfg(test)]
 mod tests {
     use super::alert_for;
-    use utopia_ingest::{Origin, ParseWarning, Provenance};
+    use utopia_ingest::ParseWarning;
     use utopia_llm::{OutOfCredit, RateLimited};
     use utopia_store::alerts::kind;
 
@@ -344,18 +337,14 @@ mod tests {
     }
 
     #[test]
-    fn a_truncation_alert_keeps_the_parser_provenance() {
+    fn a_truncation_alert_says_what_was_left_out() {
         let warning = ParseWarning {
             kind: ParseWarning::CSV_RECORDS_TRUNCATED,
-            provenance: Provenance {
-                origin: Origin::Stated,
-                model: None,
-                anchor: Some(serde_json::json!({
-                    "records_read": 10_000,
-                    "records_total": 10_001,
-                    "records_omitted": 1,
-                })),
-            },
+            detail: serde_json::json!({
+                "records_read": 10_000,
+                "records_total": 10_001,
+                "records_omitted": 1,
+            }),
         };
 
         assert_eq!(
@@ -364,15 +353,11 @@ mod tests {
                 "name": "customers.csv",
                 "warnings": [{
                     "kind": "csv.records_truncated",
-                    "provenance": {
-                        "origin": "stated",
-                        "model": null,
-                        "anchor": {
+                    "detail": {
                             "records_read": 10_000,
                             "records_total": 10_001,
                             "records_omitted": 1,
                         },
-                    },
                 }],
             })
         );

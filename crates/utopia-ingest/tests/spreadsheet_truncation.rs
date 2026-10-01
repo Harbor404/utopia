@@ -56,15 +56,14 @@ fn a_spreadsheet_past_the_row_cap_reports_the_rows_it_left_out() {
     assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
     let warning = &parsed.warnings[0];
     assert_eq!(warning.kind, "spreadsheet.rows_truncated");
-    assert_eq!(warning.provenance.origin, utopia_ingest::Origin::Stated);
     assert_eq!(
-        warning.provenance.anchor,
-        Some(serde_json::json!({
+        warning.detail,
+        serde_json::json!({
             "sheet": "Ledger",
             "rows_read": 2_000,
             "rows_total": 2_001,
             "rows_omitted": 1,
-        }))
+        })
     );
 }
 
@@ -94,14 +93,13 @@ fn a_csv_past_the_record_cap_reports_the_records_it_left_out() {
     assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
     let warning = &parsed.warnings[0];
     assert_eq!(warning.kind, "csv.records_truncated");
-    assert_eq!(warning.provenance.origin, utopia_ingest::Origin::Stated);
     assert_eq!(
-        warning.provenance.anchor,
-        Some(serde_json::json!({
+        warning.detail,
+        serde_json::json!({
             "records_read": 10_000,
             "records_total": 10_001,
             "records_omitted": 1,
-        }))
+        })
     );
 }
 

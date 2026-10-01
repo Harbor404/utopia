@@ -453,7 +453,7 @@ async fn a_truncated_csv_keeps_the_document_ready_and_reports_the_omitted_record
     assert_eq!(alerts[0]["name"], "customers.csv");
     assert_eq!(alerts[0]["warnings"][0]["kind"], "csv.records_truncated");
     assert_eq!(
-        alerts[0]["warnings"][0]["provenance"]["anchor"],
+        alerts[0]["warnings"][0]["detail"],
         serde_json::json!({
             "records_read": 10_000,
             "records_total": 10_001,

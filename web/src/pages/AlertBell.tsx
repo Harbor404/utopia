@@ -33,7 +33,7 @@ const PAGE = 8;
 /** 明细里给人看的那一行：对象名 — 报错原文或截断范围 */
 function line(d: AlertGroup["lines"][number]): string | null {
   const partial = d.warnings?.flatMap((warning) => {
-    const anchor = warning.provenance?.anchor;
+    const anchor = warning.detail;
     if (
       warning.kind === "spreadsheet.rows_truncated" &&
       typeof anchor?.sheet === "string" &&

@@ -186,11 +186,11 @@ pub struct ParsedDoc {
     pub warnings: Vec<ParseWarning>,
 }
 
-/// 解析器到了安全上限，正文有意只保留一部分；provenance 说明省略的范围。
+/// 解析器到了安全上限，正文有意只保留一部分；`detail` 说明省略的范围。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseWarning {
     pub kind: &'static str,
-    pub provenance: Provenance,
+    pub detail: serde_json::Value,
 }
 
 impl ParseWarning {

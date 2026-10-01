@@ -765,16 +765,12 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<(String, Vec<crate::ParseWarn
             let rows_read = SPREADSHEET_ROW_LIMIT;
             warnings.push(crate::ParseWarning {
                 kind: crate::ParseWarning::SPREADSHEET_ROWS_TRUNCATED,
-                provenance: crate::Provenance {
-                    origin: crate::Origin::Stated,
-                    model: None,
-                    anchor: Some(serde_json::json!({
-                        "sheet": sheet_name.clone(),
-                        "rows_read": rows_read,
-                        "rows_total": rows_total,
-                        "rows_omitted": rows_total - rows_read,
-                    })),
-                },
+                detail: serde_json::json!({
+                    "sheet": sheet_name.clone(),
+                    "rows_read": rows_read,
+                    "rows_total": rows_total,
+                    "rows_omitted": rows_total - rows_read,
+                }),
             });
         }
         // 每张表按网格渲染成带列头的 Markdown 表；一格字都没有的表退回制表符分隔
@@ -992,15 +988,11 @@ pub fn csv_text(bytes: &[u8], tsv: bool) -> anyhow::Result<(String, Vec<crate::P
         let records_read = rows.len();
         warnings.push(crate::ParseWarning {
             kind: crate::ParseWarning::CSV_RECORDS_TRUNCATED,
-            provenance: crate::Provenance {
-                origin: crate::Origin::Stated,
-                model: None,
-                anchor: Some(serde_json::json!({
-                    "records_read": records_read,
-                    "records_total": records_total,
-                    "records_omitted": records_total - records_read,
-                })),
-            },
+            detail: serde_json::json!({
+                "records_read": records_read,
+                "records_total": records_total,
+                "records_omitted": records_total - records_read,
+            }),
         });
     }
     // 第一条记录是列头（csv 的惯例）；渲染不出表时退回竖线分隔的行
