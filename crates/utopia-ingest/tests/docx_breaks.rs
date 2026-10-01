@@ -129,3 +129,16 @@ fn a_word_caption_is_repeated_for_every_piece_of_a_split_table() {
         assert!(!piece.text.contains(&analysis), "{:#?}", piece.text);
     }
 }
+
+#[test]
+fn a_non_breaking_hyphen_keeps_the_numbers_on_either_side_apart() {
+    let nbh = "<w:noBreakHyphen/>";
+    let text = read(&format!(
+        r#"<w:p><w:r><w:t xml:space="preserve">合同于 2024</w:t>{nbh}<w:t>01</w:t>{nbh}<w:t xml:space="preserve">15 签订，电话 010</w:t></w:r><w:r>{nbh}</w:r><w:r><w:t>62345678。</w:t></w:r></w:p>"#
+    ));
+    assert_eq!(text.trim(), "合同于 2024-01-15 签订，电话 010-62345678。");
+    let text = read(&table(&format!(
+        "<w:t>2024</w:t>{nbh}<w:t>01</w:t>{nbh}<w:t>15</w:t>"
+    )));
+    assert!(text.contains("| Sample | 2024-01-15 |"), "{text}");
+}
