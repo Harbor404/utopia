@@ -1580,7 +1580,19 @@ export type AlertGroup = {
   /** 跟 latest_at 一起圈出这一组，标已读时原样发回去 */
   earliest_at: string;
   /** 明细，最多几条，新的在前 */
-  lines: { name?: string; error?: string; job?: string }[];
+  lines: {
+    name?: string;
+    error?: string;
+    job?: string;
+    warnings?: {
+      kind: string;
+      provenance: {
+        origin: string;
+        model: string | null;
+        anchor: Record<string, unknown> | null;
+      };
+    }[];
+  }[];
 };
 
 export const api = {

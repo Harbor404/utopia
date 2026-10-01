@@ -56,6 +56,58 @@ pub async fn observe_job_failure(
     state.emit_alert();
 }
 
+/// 解析器只读了一部分正文：保留可用的前缀，但把截断范围和出处写进告警详情。
+/// 名字存一份——文档删掉之后这条告警还读得懂。
+pub async fn observe_document_truncated(
+    state: &AppState,
+    kb_id: uuid::Uuid,
+    document_id: uuid::Uuid,
+    filename: &str,
+    warnings: &[utopia_ingest::ParseWarning],
+) {
+    if warnings.is_empty() {
+        return;
+    }
+    if let Err(e) = alerts::raise(
+        &state.pool,
+        alerts::NewAlert {
+            kb_id: Some(kb_id),
+            severity: "warning",
+            kind: alerts::kind::DOCUMENT_CONTENTS_TRUNCATED,
+            min_role: Role::Editor,
+            subject_type: Some("document"),
+            subject_id: Some(document_id),
+            detail: document_truncation_detail(filename, warnings),
+        },
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "上报告警失败");
+        return;
+    }
+    state.emit_alert();
+}
+
+fn document_truncation_detail(
+    filename: &str,
+    warnings: &[utopia_ingest::ParseWarning],
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": filename,
+        "warnings": warnings
+            .iter()
+            .map(|warning| serde_json::json!({
+                "kind": warning.kind,
+                "provenance": {
+                    "origin": warning.provenance.origin.as_str(),
+                    "model": warning.provenance.model.as_deref(),
+                    "anchor": warning.provenance.anchor.as_ref(),
+                },
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// 一份文件的字要靠没配的那种模型读（0040）：报一条库级告警，名字存进告警里——
 /// 文件删了告警还读得懂
 pub async fn observe_document_needs_reader(
@@ -190,6 +242,7 @@ pub async fn observe_schema_sync_failure(
 #[cfg(test)]
 mod tests {
     use super::alert_for;
+    use utopia_ingest::{Origin, ParseWarning, Provenance};
     use utopia_llm::{OutOfCredit, RateLimited};
     use utopia_store::alerts::kind;
 
@@ -288,5 +341,40 @@ mod tests {
     #[test]
     fn an_ordinary_failure_still_gets_its_retries() {
         assert!(!super::hopeless(&anyhow::anyhow!("结果解析失败")));
+    }
+
+    #[test]
+    fn a_truncation_alert_keeps_the_parser_provenance() {
+        let warning = ParseWarning {
+            kind: ParseWarning::CSV_RECORDS_TRUNCATED,
+            provenance: Provenance {
+                origin: Origin::Stated,
+                model: None,
+                anchor: Some(serde_json::json!({
+                    "records_read": 10_000,
+                    "records_total": 10_001,
+                    "records_omitted": 1,
+                })),
+            },
+        };
+
+        assert_eq!(
+            super::document_truncation_detail("customers.csv", &[warning]),
+            serde_json::json!({
+                "name": "customers.csv",
+                "warnings": [{
+                    "kind": "csv.records_truncated",
+                    "provenance": {
+                        "origin": "stated",
+                        "model": null,
+                        "anchor": {
+                            "records_read": 10_000,
+                            "records_total": 10_001,
+                            "records_omitted": 1,
+                        },
+                    },
+                }],
+            })
+        );
     }
 }
