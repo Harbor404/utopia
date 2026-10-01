@@ -147,6 +147,12 @@ struct Reached {
 /// 规则就无处安放。
 type Triple = (Uuid, Uuid, Uuid);
 
+/// 一个 triple 连同有效期，是断言与已推导事实的身份。
+///
+/// 区间不同就是两条事实：落库侧的身份也包含区间，推导侧若只看 [`Triple`]，
+/// 第二段就会在进入后续公理步骤前被丢掉。
+type TimedTriple = (Triple, Option<i64>, Option<i64>);
+
 /// 拿公理推一遍这批边。
 ///
 /// **全局不动点，不再按谓词分组。** 三条规则会串起来：
@@ -163,15 +169,21 @@ type Triple = (Uuid, Uuid, Uuid);
 pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation {
     let mut out = Derivation::default();
 
-    // 断言过的三元组。**派生撞上它就让路**——asserted > derived 是硬性的
-    let asserted: HashSet<Triple> = edges
+    // 断言过的时序三元组。**派生撞上它就让路**——asserted > derived 是硬性的
+    let asserted: HashSet<TimedTriple> = edges
         .iter()
-        .map(|e| (e.edge.predicate, e.edge.subject, e.edge.object))
+        .map(|e| {
+            (
+                (e.edge.predicate, e.edge.subject, e.edge.object),
+                e.from,
+                e.to,
+            )
+        })
         .collect();
 
-    // 已经推出来的 → 怎么来的。同一条只留第一条证明：多条路径都能推出同一件事
-    // 时，展示哪一条对用户没有区别，而全存下来会让证明树的规模跟着路径数走
-    let mut reached: HashMap<Triple, Reached> = HashMap::new();
+    // 已经推出来的 → 怎么来的。同一个时序三元组只留第一条证明：多条路径都能推出
+    // 同一件事时，展示哪一条对用户没有区别，而全存下来会让证明树的规模跟着路径数走
+    let mut reached: HashMap<TimedTriple, Reached> = HashMap::new();
     // **封顶仍按谓词计**：那个常量的含义没变（一个谓词最多推两万条），
     // 而 `Derivation::capped` 回的也是谓词列表。跨谓词之后若改成全局一个数，
     // 界面上「哪个谓词太密」就答不出来了
@@ -200,9 +212,9 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
             )
         })
         .collect();
-    // 起始 frontier 的顺序跟着入参走，而入参顺序不保证——排一次，
+    // 起始 frontier 的顺序跟着入参走，而入参顺序不保证——按完整事实身份排一次，
     // 同一个库两次推导才给得出同一份结果
-    frontier.sort_by_key(|(t, _)| *t);
+    frontier.sort_by_key(|(t, acc)| (*t, acc.from, acc.to));
 
     // 轮数上限是**兜底**，真正的界在下面那条 `premises.len() >= MAX_DEPTH`：
     // 常量的含义是「路径最长 12」，按前提条数算才对得上。轮数只防病态输入
@@ -288,7 +300,7 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
                 }
             }
         }
-        next.sort_by_key(|(t, _)| *t);
+        next.sort_by_key(|(t, acc)| (*t, acc.from, acc.to));
         frontier = next;
     }
 
@@ -314,8 +326,8 @@ fn emit(
     to: Option<i64>,
     // 传递多用掉的那一条前提；一跳规则没有
     extra_premise: Option<Uuid>,
-    asserted: &HashSet<Triple>,
-    reached: &mut HashMap<Triple, Reached>,
+    asserted: &HashSet<TimedTriple>,
+    reached: &mut HashMap<TimedTriple, Reached>,
     per_pred: &mut HashMap<Uuid, usize>,
     capped: &mut HashSet<Uuid>,
     out: &mut Derivation,
@@ -327,9 +339,10 @@ fn emit(
     if subj == obj {
         return false;
     }
-    // 断言优先；已经推过的不重复推——**逆的互指靠这一条收敛**：
+    // 断言优先；同一区间上已经推过的不重复推——**逆的互指靠这一条收敛**：
     // `p⁻¹ = q` 且 `q⁻¹ = p` 时，第二轮推回来的那条已经在 reached 里
-    if asserted.contains(&t) || reached.contains_key(&t) {
+    let key = (t, from, to);
+    if asserted.contains(&key) || reached.contains_key(&key) {
         return false;
     }
     let n = per_pred.entry(pred).or_insert(0);
@@ -348,7 +361,7 @@ fn emit(
         to,
         premises: premises.clone(),
     };
-    reached.insert(t, r.clone());
+    reached.insert(key, r.clone());
     // 派生出来的边也能被后续传递接上
     if let Some(&first) = premises.first() {
         adj.entry((pred, subj))
@@ -1015,6 +1028,66 @@ mod tests {
         assert!(
             got.contains(&(Q, 3, 1)),
             "**逆产出的边要进邻接表**，否则传递接不上它"
+        );
+    }
+
+    /// 同一个 triple 可以有几段时间都成立。第二段不能被第一段挡在传递之外，
+    /// 而且输入顺序怎么排，时间闭包都要一样。
+    #[test]
+    fn distinct_intervals_for_one_triple_survive_axiom_steps_in_any_order() {
+        let ax = HashMap::from([
+            (
+                P,
+                Axioms {
+                    inverse_of: Some(Q),
+                    ..Default::default()
+                },
+            ),
+            (
+                Q,
+                Axioms {
+                    transitive: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let early = tep(P, 1, 1, 2, Some(0), Some(10));
+        let late = tep(P, 2, 1, 2, Some(20), Some(30));
+        let cb = tep(Q, 3, 3, 2, Some(20), Some(30));
+        let spans = HashMap::from([
+            (f(1), (Some(0), Some(10))),
+            (f(2), (Some(20), Some(30))),
+            (f(3), (Some(20), Some(30))),
+        ]);
+        let closure = |edges: [TimedEdge; 3]| {
+            let d = derive(&edges, &ax);
+            let mut closure: Vec<_> = d
+                .facts
+                .iter()
+                .map(|x| {
+                    let (from, to) = validity(&x.premises, &spans).expect("派生区间应当可求");
+                    (x.predicate, x.subject, x.object, from, to)
+                })
+                .collect();
+            closure.sort();
+            closure
+        };
+
+        let early_first = closure([early, late, cb]);
+        let late_first = closure([late, early, cb]);
+
+        assert_eq!(early_first, late_first, "闭包不能随 fact 输入顺序改变");
+        assert!(
+            early_first.contains(&(Q, n(2), n(1), Some(0), Some(10))),
+            "第一段 B q A 也要保留"
+        );
+        assert!(
+            early_first.contains(&(Q, n(2), n(1), Some(20), Some(30))),
+            "第二段 B q A 要保留"
+        );
+        assert!(
+            early_first.contains(&(Q, n(3), n(1), Some(20), Some(30))),
+            "第二段 B q A 必须还能和 C q B 接成 C q A"
         );
     }
 
