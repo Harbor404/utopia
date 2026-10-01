@@ -131,6 +131,9 @@ pub fn overlap(
 /// 从某个主语出发的一条边：(宾语, 起, 止, 事实 id)。
 type Hop = (Uuid, Option<i64>, Option<i64>, Uuid);
 
+/// 半开区间 `[from, to)`，两端可空。
+type Span = (Option<i64>, Option<i64>);
+
 /// 派生的中间态:一个 (主语, 宾语) 对是怎么来的。
 #[derive(Clone)]
 struct Reached {
@@ -147,11 +150,7 @@ struct Reached {
 /// 规则就无处安放。
 type Triple = (Uuid, Uuid, Uuid);
 
-/// 一个 triple 连同有效期，是断言与已推导事实的身份。
-///
-/// 区间不同就是两条事实：落库侧的身份也包含区间，推导侧若只看 [`Triple`]，
-/// 第二段就会在进入后续公理步骤前被丢掉。
-type TimedTriple = (Triple, Option<i64>, Option<i64>);
+// 同一个 triple 可以有几段互不包含的有效期；被更宽区间完全覆盖的那段不再另留一份。
 
 /// 拿公理推一遍这批边。
 ///
@@ -169,21 +168,19 @@ type TimedTriple = (Triple, Option<i64>, Option<i64>);
 pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation {
     let mut out = Derivation::default();
 
-    // 断言过的时序三元组。**派生撞上它就让路**——asserted > derived 是硬性的
-    let asserted: HashSet<TimedTriple> = edges
-        .iter()
-        .map(|e| {
-            (
-                (e.edge.predicate, e.edge.subject, e.edge.object),
-                e.from,
-                e.to,
-            )
-        })
-        .collect();
+    // 断言过的时序三元组。**派生撞上它就让路**——asserted > derived 是硬性的；
+    // 判断的是区间覆盖，不只是等值，所以无时间/更宽的一段也能挡住窄的派生。
+    let mut asserted: HashMap<Triple, Vec<Span>> = HashMap::new();
+    for e in edges {
+        asserted
+            .entry((e.edge.predicate, e.edge.subject, e.edge.object))
+            .or_default()
+            .push((e.from, e.to));
+    }
 
-    // 已经推出来的 → 怎么来的。同一个时序三元组只留第一条证明：多条路径都能推出
-    // 同一件事时，展示哪一条对用户没有区别，而全存下来会让证明树的规模跟着路径数走
-    let mut reached: HashMap<TimedTriple, Reached> = HashMap::new();
+    // 已经推出来的 → 怎么来的。同一个 triple 只保留互不包含的区间；一个区间被
+    // 已有证明覆盖时，展示哪一条对用户没有区别，而全存下来会让证明树跟路径数走
+    let mut reached: HashMap<Triple, Vec<(Span, Reached)>> = HashMap::new();
     // **封顶仍按谓词计**：那个常量的含义没变（一个谓词最多推两万条），
     // 而 `Derivation::capped` 回的也是谓词列表。跨谓词之后若改成全局一个数，
     // 界面上「哪个谓词太密」就答不出来了
@@ -310,6 +307,16 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
     out
 }
 
+/// `outer` 是否覆盖 `inner`。两端都为 `None` 表示无界，因此能覆盖任何同向区间。
+fn span_contains(outer: Span, inner: Span) -> bool {
+    outer
+        .0
+        .is_none_or(|outer| inner.0.is_some_and(|inner| outer <= inner))
+        && outer
+            .1
+            .is_none_or(|outer| inner.1.is_some_and(|inner| outer >= inner))
+}
+
 /// 落一条派生，并把它接进邻接表供后续传递使用。返回 true = 这个谓词封顶了。
 ///
 /// 参数多得难看，但把它抽出来是必要的：四条规则各自的落地动作一模一样
@@ -326,8 +333,8 @@ fn emit(
     to: Option<i64>,
     // 传递多用掉的那一条前提；一跳规则没有
     extra_premise: Option<Uuid>,
-    asserted: &HashSet<TimedTriple>,
-    reached: &mut HashMap<TimedTriple, Reached>,
+    asserted: &HashMap<Triple, Vec<Span>>,
+    reached: &mut HashMap<Triple, Vec<(Span, Reached)>>,
     per_pred: &mut HashMap<Uuid, usize>,
     capped: &mut HashSet<Uuid>,
     out: &mut Derivation,
@@ -339,10 +346,18 @@ fn emit(
     if subj == obj {
         return false;
     }
-    // 断言优先；同一区间上已经推过的不重复推——**逆的互指靠这一条收敛**：
-    // `p⁻¹ = q` 且 `q⁻¹ = p` 时，第二轮推回来的那条已经在 reached 里
-    let key = (t, from, to);
-    if asserted.contains(&key) || reached.contains_key(&key) {
+    // 断言优先；同一个 triple 上已有更宽区间时也不重复推——**逆的互指靠这一条
+    // 收敛**：`p⁻¹ = q` 且 `q⁻¹ = p` 时，第二轮推回来的那条已经被 reached 覆盖。
+    // 不能只比等值：无时间断言应覆盖日期的派生，较宽的原子区间也应覆盖交集。
+    let span = (from, to);
+    let covered = asserted
+        .get(&t)
+        .into_iter()
+        .flatten()
+        .copied()
+        .chain(reached.get(&t).into_iter().flatten().map(|(span, _)| *span))
+        .any(|outer| span_contains(outer, span));
+    if covered {
         return false;
     }
     let n = per_pred.entry(pred).or_insert(0);
@@ -361,7 +376,7 @@ fn emit(
         to,
         premises: premises.clone(),
     };
-    reached.insert(key, r.clone());
+    reached.entry(t).or_default().push((span, r.clone()));
     // 派生出来的边也能被后续传递接上
     if let Some(&first) = premises.first() {
         adj.entry((pred, subj))
@@ -424,8 +439,6 @@ pub struct RuleClash {
     pub pairs: Vec<(usize, usize)>,
 }
 
-/// 半开区间 `[from, to)`，两端可空
-type Span = (Option<i64>, Option<i64>);
 /// (谓词, 一端) → 另一端的边：(另一端, 事实, 区间)。functional 两个方向各一份
 type ByEnd = HashMap<(Uuid, Uuid), Vec<(Uuid, Uuid, Span)>>;
 /// 一条规则的身份：声明所在的谓词 + 规则种类
@@ -1088,6 +1101,70 @@ mod tests {
         assert!(
             early_first.contains(&(Q, n(3), n(1), Some(20), Some(30))),
             "第二段 B q A 必须还能和 C q B 接成 C q A"
+        );
+    }
+
+    /// 断言的一段区间如果覆盖了派生出来的更窄区间，就不再留下第二条同 triple 的事实。
+    #[test]
+    fn an_asserted_interval_covers_a_narrower_derivation() {
+        let edges = [
+            te(1, 1, 2, Some(10), Some(20)),
+            te(2, 2, 3, Some(10), Some(20)),
+            te(3, 1, 3, Some(0), Some(100)),
+        ];
+        let d = derive(&edges, &transitive());
+        assert!(
+            d.facts.is_empty(),
+            "断言 [0,100) 已覆盖推出来的 [10,20)，不该再派生一份"
+        );
+    }
+
+    /// 无时间断言表示一直成立，也覆盖有日期的同 triple 派生。
+    #[test]
+    fn an_undated_assertion_covers_a_dated_derivation() {
+        let edges = [
+            te(1, 1, 2, Some(10), Some(20)),
+            te(2, 2, 3, Some(10), Some(20)),
+            te(3, 1, 3, None, None),
+        ];
+        let d = derive(&edges, &transitive());
+        assert!(
+            d.facts.is_empty(),
+            "无时间断言覆盖 [10,20)，不该推出一条说得更少的同 triple 事实"
+        );
+    }
+
+    /// 两条路径分别推出 [0,100) 与 [10,20)：宽的保留，窄的丢掉；输入反序也一样。
+    #[test]
+    fn a_wider_route_suppresses_a_narrower_derivation() {
+        let edges = [
+            te(1, 1, 2, Some(0), Some(100)),
+            te(2, 2, 4, Some(0), Some(100)),
+            te(3, 1, 3, Some(10), Some(20)),
+            te(4, 3, 4, Some(10), Some(20)),
+        ];
+        let by_fact: HashMap<_, _> = edges
+            .iter()
+            .map(|e| (e.edge.fact, (e.from, e.to)))
+            .collect();
+        let spans = |edges: [TimedEdge; 4]| {
+            let d = derive(&edges, &transitive());
+            let mut spans: Vec<_> = d
+                .facts
+                .iter()
+                .filter(|x| x.subject == n(1) && x.object == n(4))
+                .map(|x| validity(&x.premises, &by_fact).expect("派生区间应当可求"))
+                .collect();
+            spans.sort();
+            spans
+        };
+
+        let broad = (Some(0), Some(100));
+        assert_eq!(spans(edges), vec![broad], "只留下覆盖更宽的 [0,100)");
+        assert_eq!(
+            spans([edges[3], edges[2], edges[1], edges[0]]),
+            vec![broad],
+            "输入反序不能把被覆盖的窄区间又放回来"
         );
     }
 
