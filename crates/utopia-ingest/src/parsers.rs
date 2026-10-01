@@ -136,10 +136,11 @@ fn pdf_with_poppler(bytes: &[u8]) -> anyhow::Result<String> {
     String::from_utf8(output.stdout).context("pdftotext returned invalid UTF-8")
 }
 
-/// docx：解压 word/document.xml。正文 w:t 取字、w:p 分段；表格（w:tbl）收成网格交给
-/// `table::render_grid`，和 HTML 表走同一套渲染：w:gridSpan 跨列，上下合并（w:vMerge）的
-/// 续格留空，格内段落的左缩进 w:ind 当内边距（小节行靠它折进标签）。套在格子里的表按格子
-/// 文字处理。标题（有大纲级别的段落，见 [`docx_heading_styles`]）写成 Markdown 标题。
+/// docx：解压 word/document.xml。正文 w:t 取字；不在表格里的 w:p 是一段，段末留空行；
+/// 段内的 w:br/w:cr 仍是单换行。表格（w:tbl）收成网格交给 `table::render_grid`，和 HTML 表
+/// 走同一套渲染：w:gridSpan 跨列，上下合并（w:vMerge）的续格留空，格内段落的左缩进 w:ind
+/// 当内边距（小节行靠它折进标签）。套在格子里的表按格子文字处理。标题（有大纲级别的段落，
+/// 见 [`docx_heading_styles`]）写成 Markdown 标题。
 pub fn docx(bytes: &[u8]) -> anyhow::Result<String> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(bytes)).context("Malformed docx structure")?;
@@ -257,9 +258,12 @@ pub(crate) fn docx_xml_to_text(
     let mut cell: Option<(String, usize, u32)> = None;
     // 正文里的一段（不在表格里、不是文本框里套着的段）是不是标题。`paragraphs` 数套了几层
     // w:p，`para_start` 是这一段在 out 里开始的位置。级别先看段落自己写的 w:outlineLvl，
-    // 再看它的样式；两样都只认第一次出现的，w:pPrChange 里记的是修订之前的样式，不算
+    // 再看它的样式；两样都只认第一次出现的，w:pPrChange 里记的是修订之前的样式，不算。
+    // 另一个栈记每段开始的位置，用来在段末把空段丢掉、非空段之间只留一个空行。文本框会
+    // 在宿主段里再套 w:p，栈让内层段落也能各自收尾，而标题判定仍只看最外层。
     let mut paragraphs = 0usize;
     let mut para_start = 0usize;
+    let mut paragraph_starts: Vec<usize> = Vec::new();
     let mut own_level: Option<Option<u8>> = None;
     let mut style_level: Option<Option<u8>> = None;
     let mut in_revision = false;
@@ -336,6 +340,9 @@ pub(crate) fn docx_xml_to_text(
                 "w:t" => in_text = true,
                 "w:p" => {
                     paragraphs += 1;
+                    if cell.is_none() {
+                        paragraph_starts.push(out.len());
+                    }
                     if paragraphs == 1 && cell.is_none() {
                         para_start = out.len();
                         own_level = None;
@@ -390,11 +397,12 @@ pub(crate) fn docx_xml_to_text(
                     match cell.as_mut() {
                         Some(c) => c.0.push(' '),
                         None => {
+                            let start = paragraph_starts.pop().unwrap_or(out.len());
                             // 标题写成一行 Markdown 标题：分块器靠它给每块开头补上所在的各级标题，
                             // 时间解释靠块里的标题行分节（0064 决定 1 按 cut 2 修订的那段）。没有
                             // 它，一份 Word 里各节的日期都算成第一节的
                             let level = own_level.unwrap_or(style_level.flatten());
-                            if let Some(level) = level.filter(|_| paragraphs == 1) {
+                            if let Some(level) = level.filter(|_| paragraph_starts.is_empty()) {
                                 let title = out[para_start..]
                                     .split_whitespace()
                                     .collect::<Vec<_>>()
@@ -406,7 +414,15 @@ pub(crate) fn docx_xml_to_text(
                                     out.push_str(&title);
                                 }
                             }
-                            out.push('\n');
+                            // 一个 Word 段落是一个 Markdown 段。收尾时先去掉段内末尾的空白，
+                            // 空段不留痕；非空段只补一个空行，w:br 产生的段内单换行不受影响。
+                            let end = start + out[start..].trim_end().len();
+                            if end == start {
+                                out.truncate(start);
+                            } else {
+                                out.truncate(end);
+                                out.push_str("\n\n");
+                            }
                         }
                     }
                     paragraphs = paragraphs.saturating_sub(1);
@@ -421,7 +437,11 @@ pub(crate) fn docx_xml_to_text(
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
                         if let Some(md) = crate::table::render_grid(&rows, false) {
-                            out.push('\n');
+                            if !out.is_empty() {
+                                let end = out.trim_end().len();
+                                out.truncate(end);
+                                out.push_str("\n\n");
+                            }
                             out.push_str(&md);
                             out.push_str("\n\n");
                         }
@@ -463,7 +483,8 @@ pub(crate) fn docx_xml_to_text(
     Ok(out)
 }
 
-/// PPTX: extract a:t text in the presentation's logical slide order.
+/// PPTX: extract a:t text in the presentation's logical slide order. Tables under a:tbl
+/// become Markdown grids through the same renderer as DOCX and spreadsheet tables.
 pub fn pptx(bytes: &[u8]) -> anyhow::Result<String> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(bytes.to_vec())).context("Failed to unzip pptx")?;
@@ -493,7 +514,7 @@ pub fn pptx(bytes: &[u8]) -> anyhow::Result<String> {
     let mut out = String::new();
     for (num, name) in slides {
         let xml = pptx_part(&mut archive, &name)?;
-        let text = extract_xml_text(&xml, "a:t", "a:p", "a:br")?;
+        let text = pptx_xml_to_text(&xml)?;
         if !text.trim().is_empty() {
             out.push_str(&format!("\n## Slide {num}\n{text}\n"));
         }
@@ -1026,45 +1047,159 @@ fn read_zip_entry(
     Ok(content)
 }
 
-/// 从 OOXML 里抽取 `text_tag`（如 a:t）内的文本，遇 `para_tag`（如 a:p）结束换行，
-/// 遇 `break_tag`（如 a:br）也换行。
-fn extract_xml_text(
-    xml: &str,
-    text_tag: &str,
-    para_tag: &str,
-    break_tag: &str,
-) -> anyhow::Result<String> {
+/// 从 PPTX 的 slide XML 里读文字。表外的 `a:p`/`a:br` 仍按原来的换行规则；
+/// `a:tbl` 里的每个 `a:tr` 收成一行，每个 `a:tc` 收成一格，格内段落用空格连接。
+fn pptx_xml_to_text(xml: &str) -> anyhow::Result<String> {
+    #[derive(Default)]
+    struct TableCell {
+        text: String,
+        span: usize,
+        horizontal_merge: bool,
+        vertical_merge: bool,
+    }
+
+    fn attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String> {
+        e.attributes()
+            .flatten()
+            .find(|a| a.key.as_ref() == name)
+            .map(|a| a.value.to_string())
+    }
+
+    fn truthy(e: &quick_xml::events::BytesStart<'_>, name: &str) -> bool {
+        matches!(attr(e, name).as_deref(), Some("1" | "true" | "on"))
+    }
+
     let mut reader = Reader::from_str(xml);
     let mut out = String::new();
     let mut in_text = false;
+    let mut table_depth = 0usize;
+    let mut rows: Vec<GridRow> = Vec::new();
+    let mut row: GridRow = Vec::new();
+    let mut cell: Option<TableCell> = None;
+    let mut first_is_header = false;
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) if e.name().as_ref() == text_tag => in_text = true,
-            // 段落里换的行（Shift+Enter）不是新段落，是两个 run 之间的一个 `<a:br>`。丢了它，
-            // 标题「Q1」换行「2024」读成「Q12024」，季度和年份一起没了（Word 格子里的同一件事
-            // 见 #813）
-            Ok(Event::Start(e) | Event::Empty(e)) if e.name().as_ref() == break_tag => {
-                out.push('\n');
-            }
-            Ok(Event::End(e)) => {
-                let name = e.name();
-                if name.as_ref() == text_tag {
-                    in_text = false;
-                } else if name.as_ref() == para_tag {
-                    out.push('\n');
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                "a:tbl" => {
+                    table_depth += 1;
+                    if table_depth == 1 {
+                        rows.clear();
+                        row.clear();
+                        cell = None;
+                        first_is_header = false;
+                    }
+                }
+                "a:tblPr" if table_depth == 1 => {
+                    first_is_header = truthy(&e, "firstRow");
+                }
+                "a:tr" if table_depth == 1 => row.clear(),
+                "a:tc" if table_depth == 1 => {
+                    cell = Some(TableCell {
+                        span: 1,
+                        ..TableCell::default()
+                    });
+                }
+                "a:tcPr" if table_depth == 1 => {
+                    if let Some(c) = cell.as_mut() {
+                        if let Some(span) = attr(&e, "gridSpan").and_then(|v| v.parse().ok()) {
+                            c.span = span;
+                        }
+                        c.horizontal_merge = truthy(&e, "hMerge");
+                        c.vertical_merge = truthy(&e, "vMerge");
+                    }
+                }
+                "a:t" => {
+                    if cell.is_some() || table_depth == 0 {
+                        in_text = true;
+                    }
+                }
+                "a:br" => match cell.as_mut() {
+                    Some(c) => c.text.push(' '),
+                    None if table_depth == 0 => out.push('\n'),
+                    _ => {}
+                },
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => match e.name().as_ref() {
+                "a:tblPr" if table_depth == 1 => {
+                    first_is_header = truthy(&e, "firstRow");
+                }
+                "a:tcPr" if table_depth == 1 => {
+                    if let Some(c) = cell.as_mut() {
+                        if let Some(span) = attr(&e, "gridSpan").and_then(|v| v.parse().ok()) {
+                            c.span = span;
+                        }
+                        c.horizontal_merge = truthy(&e, "hMerge");
+                        c.vertical_merge = truthy(&e, "vMerge");
+                    }
+                }
+                "a:br" => match cell.as_mut() {
+                    Some(c) => c.text.push(' '),
+                    None if table_depth == 0 => out.push('\n'),
+                    _ => {}
+                },
+                "a:tab" => {
+                    if let Some(c) = cell.as_mut() {
+                        c.text.push(' ');
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                "a:t" => in_text = false,
+                "a:p" => match cell.as_mut() {
+                    Some(c) => c.text.push(' '),
+                    None if table_depth == 0 => out.push('\n'),
+                    _ => {}
+                },
+                "a:tc" if table_depth == 1 => {
+                    if let Some(mut c) = cell.take() {
+                        if !c.horizontal_merge {
+                            if c.vertical_merge {
+                                c.text.clear();
+                            }
+                            row.push((c.text, c.span.max(1), 0));
+                        }
+                    }
+                }
+                "a:tr" if table_depth == 1 => rows.push(std::mem::take(&mut row)),
+                "a:tbl" => {
+                    table_depth = table_depth.saturating_sub(1);
+                    if table_depth == 0 {
+                        if let Some(md) = crate::table::render_grid(&rows, first_is_header) {
+                            out.push('\n');
+                            out.push_str(&md);
+                            out.push_str("\n\n");
+                        }
+                        rows.clear();
+                        row.clear();
+                        cell = None;
+                        first_is_header = false;
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Text(t)) if in_text => {
+                let text = t.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                match cell.as_mut() {
+                    Some(c) => c.text.push_str(&text),
+                    None => out.push_str(&text),
                 }
             }
-            Ok(Event::Text(t)) if in_text => {
-                out.push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
-            }
             Ok(Event::CData(t)) if in_text => {
-                out.push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
+                let text = t.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                match cell.as_mut() {
+                    Some(c) => c.text.push_str(&text),
+                    None => out.push_str(&text),
+                }
             }
             Ok(Event::GeneralRef(e)) if in_text => {
                 let reference = format!("&{};", e.into_inner());
-                match quick_xml::escape::unescape(&reference) {
-                    Ok(s) => out.push_str(&s),
-                    Err(_) => out.push_str(&reference),
+                let text = quick_xml::escape::unescape(&reference)
+                    .unwrap_or(std::borrow::Cow::Borrowed(&reference));
+                match cell.as_mut() {
+                    Some(c) => c.text.push_str(&text),
+                    None => out.push_str(&text),
                 }
             }
             Ok(Event::Eof) => break,
@@ -1090,14 +1225,14 @@ mod tests {
     #[test]
     fn a_docx_table_is_rendered_under_its_headings() {
         let text = docx_xml_to_text(DOC, &Default::default()).unwrap();
-        assert!(text.starts_with("Segment results\n"), "{text}");
+        assert!(text.starts_with("Segment results\n\n"), "{text}");
         assert!(
             text.contains(
                 "| Segment | Revenue |\n| --- | --- |\n| Cloud | $1,200 |\n| Devices | $300 |"
             ),
             "{text}"
         );
-        assert!(text.ends_with("After the table.\n"), "{text}");
+        assert!(text.ends_with("After the table.\n\n"), "{text}");
     }
 
     /// 套在格子里的表不单独成表：它的字算外层格子的字
